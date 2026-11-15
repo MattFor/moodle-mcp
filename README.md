@@ -1,4 +1,4 @@
-# moodle-mcp
+# Moodle MCP
 
 [![CI](https://github.com/MattFor/moodle-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/MattFor/moodle-mcp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattFor/moodle-mcp)](https://github.com/MattFor/moodle-mcp/releases)
