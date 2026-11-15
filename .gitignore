@@ -1,0 +1,13 @@
+.idea
+.vscode
+*.swp
+*~
+
+__pycache__
+*.py[cod]
+.ruff_cache
+.venv
+.pycheck/
+
+*.bak-*
+*.prev

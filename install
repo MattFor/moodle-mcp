@@ -1,0 +1,118 @@
+#!/bin/sh
+
+# Install moodle-mcp for the current user.
+#
+#   ./install             into ~/.local/bin
+#   ./install --mcp       also register it with Claude Code, Codex, Copilot CLI and Cursor, where installed
+#   ./install --all       all of the above
+#   ./install --dry-run   print what would happen
+#
+# Then sign in once: moodle-mcp login <your Moodle site>
+
+set -eu
+
+SRC="$(cd "$(dirname "$0")" && pwd)"
+BIN="$HOME/.local/bin"
+STAMP="$(date +%Y%m%d%H%M%S)"
+
+DO_MCP=0
+DRY=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --mcp | --all) DO_MCP=1 ;;
+        --dry-run | -n) DRY=1 ;;
+        --help | -h)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "install: unknown option $arg (try --help)" >&2
+            exit 2
+            ;;
+    esac
+done
+
+say() { printf '%s\n' "$*"; }
+run() {
+    if [ "$DRY" = 1 ]; then
+        printf '  would run: %s\n' "$*"
+    else
+        "$@"
+    fi
+}
+
+command -v python3 >/dev/null 2>&1 || say "WARNING: python3 is not on PATH"
+
+say "moodle-mcp -> $BIN/moodle-mcp"
+if [ -e "$BIN/moodle-mcp" ] && ! cmp -s "$SRC/moodle-mcp" "$BIN/moodle-mcp"; then
+    say "  backing up $BIN/moodle-mcp -> $BIN/moodle-mcp.bak-$STAMP"
+    run cp -p "$BIN/moodle-mcp" "$BIN/moodle-mcp.bak-$STAMP"
+fi
+run mkdir -p "$BIN"
+run install -m 755 "$SRC/moodle-mcp" "$BIN/moodle-mcp"
+
+# The browser hands the login's moodlemobile:// link to moodle-mcp instead of the Moodle app.
+APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+say "moodlemobile:// links -> $APPS/moodle-mcp.desktop"
+if [ "$DRY" = 1 ]; then
+    say "  would write $APPS/moodle-mcp.desktop"
+else
+    mkdir -p "$APPS"
+    cat >"$APPS/moodle-mcp.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=moodle-mcp
+Comment=Finishes moodle-mcp login
+Exec="$BIN/moodle-mcp" %u
+MimeType=x-scheme-handler/moodlemobile;
+NoDisplay=true
+EOF
+fi
+# A stale cache hides the handler from portals and app choosers.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    run update-desktop-database "$APPS"
+fi
+if command -v xdg-mime >/dev/null 2>&1; then
+    run xdg-mime default moodle-mcp.desktop x-scheme-handler/moodlemobile
+else
+    say "WARNING: xdg-mime is not on PATH, the browser will not hand the login link over"
+fi
+
+add_to() {
+    command -v "$1" >/dev/null 2>&1 || return 0
+    if "$1" mcp get moodle >/dev/null 2>&1; then
+        say "$1 already has an MCP server called moodle"
+    else
+        say "registering with $1"
+        run "$@"
+    fi
+}
+
+if [ "$DO_MCP" = 1 ]; then
+    add_to claude mcp add --scope user moodle -- "$BIN/moodle-mcp"
+    add_to codex mcp add moodle -- "$BIN/moodle-mcp"
+    add_to copilot mcp add moodle -- "$BIN/moodle-mcp"
+    if [ -d "$HOME/.cursor" ]; then
+        say "registering with cursor"
+        run python3 - "$HOME/.cursor/mcp.json" "$BIN/moodle-mcp" <<'EOF'
+import json, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    config = json.loads(path.read_text()) if path.exists() else {}
+    servers = config.setdefault('mcpServers', {})
+except (ValueError, AttributeError):
+    print(f'  WARNING: could not read {path}, add moodle-mcp there by hand')
+    sys.exit()
+if 'moodle' in servers:
+    print('  cursor already has an MCP server called moodle')
+else:
+    servers['moodle'] = {'command': sys.argv[2]}
+    path.write_text(json.dumps(config, indent=2) + '\n')
+EOF
+    fi
+fi
+
+say "Done. Sign in once with: moodle-mcp login <your Moodle site>"

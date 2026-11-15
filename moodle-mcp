@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""MCP server for Moodle (web services), over stdio.
+
+moodle-mcp                serve MCP on stdin/stdout (what agents run)
+moodle-mcp login <site>   sign in and save the access key
+moodle-mcp <link>         (run by the browser) pass the moodlemobile:// sign-in link to a waiting login
+"""
+
+import base64
+import binascii
+import datetime as dt
+import getpass
+import hashlib
+import html
+import json
+import os
+import re
+import secrets
+import select
+import sys
+import termios
+import urllib.parse
+import urllib.request
+import webbrowser
+from pathlib import Path
+
+VERSION = '0.0.0'
+CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'moodle-mcp' / 'login.json'
+CACHE = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'moodle-mcp'
+MAX_DOWNLOAD = 200 << 20
+# call_external_functions would run any other function past these checks.
+BLOCKED = re.compile(r'token|autologin|key|password|call_external')
+
+READ_HELP = """Call a read-only Moodle web-service function as the user; returns its JSON.
+HTML is flattened to text (images become `(image <url>)`), empty fields are dropped, Unix timestamps get a `<field>_local` twin.
+Start with core_webservice_get_site_info: it gives `userid` and every function this account may call.
+Common calls:
+- core_enrol_get_users_courses {userid}: enrolled courses
+- core_course_get_contents {courseid}: sections, activities and file URLs (fetch those with moodle_download)
+- core_calendar_get_action_events_by_timesort {timesortfrom: <unix seconds>, limitnum: 50}: upcoming deadlines
+- mod_assign_get_assignments {courseids: [id]}, mod_assign_get_submission_status {assignid}
+- gradereport_user_get_grade_items {courseid, userid}, gradereport_overview_get_course_grades {userid}
+- mod_forum_get_forums_by_courses {courseids: [id]}, mod_forum_get_forum_discussions {forumid},
+  mod_forum_get_discussion_posts {discussionid}
+- mod_quiz_get_quizzes_by_courses {courseids: [id]}, mod_quiz_get_user_attempts {quizid}
+- message_popup_get_popup_notifications {useridto}, core_message_get_conversations {userid}
+Only functions with _get_, _search_ or _list_ in their name run here; moodle_write runs the rest."""
+
+WRITE_HELP = """Call a Moodle web-service function that changes something, as the user; returns its JSON.
+Ask the user before calling it: submissions, posts and messages are seen by teachers and other students.
+Hand in homework:
+1. moodle_upload each file into one draft area (pass the first upload's itemid to the rest)
+2. mod_assign_save_submission {assignmentid, plugindata: {files_filemanager: <itemid>}}
+   (online text: plugindata.onlinetext_editor {text, format: 1, itemid: <itemid>})
+3. mod_assign_submit_for_grading {assignmentid, acceptsubmissionstatement: 1}, if the assignment needs it
+Other common calls:
+- mod_forum_add_discussion_post {postid, subject, message}
+- core_message_send_instant_messages {messages: [{touserid, text}]}
+- core_completion_update_activity_completion_status_manually {cmid, completed}
+Functions that handle keys, tokens or passwords, or call other functions, are blocked."""
+
+FUNCTION_ARGS = {
+	'type': 'object',
+	'properties': {
+		'function': {'type': 'string', 'description': 'Web-service function, e.g. core_course_get_contents'},
+		'args': {'type': 'object', 'description': 'Its parameters; nested objects and arrays are fine'},
+	},
+	'required': ['function'],
+}
+
+TOOLS = [
+	{
+		'name': 'moodle_read',
+		'description': READ_HELP,
+		'inputSchema': FUNCTION_ARGS,
+		'annotations': {'readOnlyHint': True},
+	},
+	{
+		'name': 'moodle_write',
+		'description': WRITE_HELP,
+		'inputSchema': FUNCTION_ARGS,
+		'annotations': {'readOnlyHint': False, 'destructiveHint': True},
+	},
+	{
+		'name': 'moodle_upload',
+		'description': 'Upload a local file into a private draft area on Moodle; returns the draft `itemid` for moodle_write.',
+		'inputSchema': {
+			'type': 'object',
+			'properties': {
+				'path': {'type': 'string', 'description': 'Local file to upload'},
+				'itemid': {'type': 'integer', 'description': 'Add to this draft area instead of starting a new one'},
+			},
+			'required': ['path'],
+		},
+		'annotations': {'readOnlyHint': False, 'destructiveHint': False},
+	},
+	{
+		'name': 'moodle_download',
+		'description': 'Download a Moodle file (a `fileurl` from moodle_read, …/pluginfile.php/…) and return its local path.',
+		'inputSchema': {
+			'type': 'object',
+			'properties': {
+				'url': {'type': 'string', 'description': 'File URL on the Moodle site'},
+				'directory': {
+					'type': 'string',
+					'description': 'Where to save it. Default: the moodle-mcp cache folder. Existing files there are kept.',
+				},
+			},
+			'required': ['url'],
+		},
+		'annotations': {'readOnlyHint': False, 'destructiveHint': False},
+	},
+]
+
+
+def signed_in():
+	"""Returns (site, key) saved by `moodle-mcp login`."""
+	try:
+		saved = json.loads(CONFIG.read_text(encoding='utf-8'))
+		return saved['site'], saved['token']
+	except (OSError, ValueError, LookupError, TypeError):
+		raise ValueError('Not signed in: run `moodle-mcp login <site>` in a terminal.') from None
+
+
+def save(site, key):
+	CONFIG.parent.mkdir(parents=True, exist_ok=True)
+	partial = CONFIG.with_name(f'{CONFIG.name}.part')
+	# Written beside the file and swapped in, so a crash cannot leave it half-written.
+	with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w', encoding='utf-8') as file:
+		json.dump({'site': site, 'token': key}, file)
+	os.replace(partial, CONFIG)
+
+
+def check(function, write):
+	if not isinstance(function, str) or not re.fullmatch(r'[a-z][a-z0-9_]*', function):
+		raise ValueError(f'Not a web-service function name: {function!r}.')
+	if BLOCKED.search(function):
+		raise ValueError('Functions that handle keys, tokens or passwords, or call other functions, are blocked.')
+	if not write and not re.search(r'_(get|search|list)_', function):
+		raise ValueError('Only read functions (_get_, _search_, _list_ in the name) run here; use moodle_write.')
+
+
+def flatten(value, prefix=''):
+	"""Yields the PHP-style form fields Moodle expects: {'a': [{'b': 1}]} -> ('a[0][b]', '1')."""
+	if isinstance(value, dict):
+		for key, item in value.items():
+			yield from flatten(item, f'{prefix}[{key}]' if prefix else str(key))
+	elif isinstance(value, list):
+		for index, item in enumerate(value):
+			yield from flatten(item, f'{prefix}[{index}]')
+	elif isinstance(value, bool):
+		yield prefix, str(int(value))
+	elif value is not None:
+		yield prefix, str(value)
+
+
+def tidy(value):
+	if isinstance(value, list):
+		return [tidy(item) for item in value]
+	if isinstance(value, str) and '<' in value:
+		value = re.sub(r'(?is)<(script|style)\b.*?</\1>', '', value)
+		value = re.sub(r'(?is)<a\s[^>]*?href="([^"]+)"[^>]*>(.*?)</a>', r'\2 (\1)', value)
+		value = re.sub(r'(?is)<img\s[^>]*?src="([^"]+)"[^>]*>', r' (image \1) ', value)
+		return ' '.join(html.unescape(re.sub(r'(?s)<[^>]+>', ' ', value)).split())
+	if not isinstance(value, dict):
+		return value
+	out = {}
+	for key, raw in value.items():
+		item = tidy(raw)
+		if item is None or item == '' or item == [] or item == {}:
+			continue
+		out[key] = item
+		if type(item) is int and 10**9 < item < 4 * 10**9 and re.search(r'time|date|due|access', key):
+			out[f'{key}_local'] = dt.datetime.fromtimestamp(item).astimezone().isoformat(timespec='minutes')
+	return out
+
+
+def post(url, fields, data=None, content_type=None, timeout=60):
+	headers = {'User-Agent': 'moodle-mcp', **({'Content-Type': content_type} if content_type else {})}
+	body = data if data is not None else urllib.parse.urlencode(fields).encode()
+	return urllib.request.urlopen(urllib.request.Request(url, body, headers), timeout=timeout)
+
+
+def call(function, args, write=False):
+	check(function, write)
+	site, key = signed_in()
+	fields = [('wstoken', key), ('wsfunction', function), ('moodlewsrestformat', 'json'), *flatten(args)]
+	with post(f'{site}/webservice/rest/server.php', fields) as response:
+		result = json.load(response)
+	if isinstance(result, dict) and 'exception' in result:
+		expired = result.get('errorcode') == 'invalidtoken'
+		hint = f' The key is no longer valid: run `moodle-mcp login {site}` in a terminal.' if expired else ''
+		raise ValueError(f'{result.get("errorcode")}: {result.get("message")}{hint}')
+	return result
+
+
+def upload(path, itemid=0):
+	site, key = signed_in()
+	file = Path(path).expanduser()
+	content = file.read_bytes()
+	boundary = secrets.token_hex(16)
+	name = re.sub(r'["\r\n]', '_', file.name)
+	fields = {'token': key, 'filearea': 'draft', 'itemid': str(int(itemid))}
+	parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n' for k, v in fields.items()]
+	head = f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+	head += 'Content-Type: application/octet-stream\r\n\r\n'
+	data = ''.join([*parts, head]).encode() + content + f'\r\n--{boundary}--\r\n'.encode()
+	content_type = f'multipart/form-data; boundary={boundary}'
+	with post(f'{site}/webservice/upload.php', None, data, content_type, timeout=300) as response:
+		result = json.load(response)
+	if isinstance(result, dict):
+		raise ValueError(f'{result.get("errorcode")}: {result.get("error") or result.get("message")}')
+	return result
+
+
+def download(url, directory=None):
+	site, key = signed_in()
+	parts = urllib.parse.urlsplit(url)
+	# The key goes along with the request, so it must never leave the site.
+	if not url.startswith(f'{site}/') or '/pluginfile.php/' not in parts.path:
+		raise ValueError(f'Only {site}/…/pluginfile.php/… file URLs can be downloaded.')
+	path = parts.path
+	if '/webservice/pluginfile.php/' not in path:
+		path = path.replace('/pluginfile.php/', '/webservice/pluginfile.php/', 1)
+	name = os.path.basename(urllib.parse.unquote(path))
+	if name in ('', '.', '..'):
+		name = 'file'
+	folder = Path(directory).expanduser() if directory else CACHE
+	target = folder / name
+	if directory and target.exists():
+		raise ValueError(f'{target} already exists; pick another directory.')
+	folder.mkdir(parents=True, exist_ok=True)
+	partial = target.with_name(f'{name}.part')
+	with post(f'{parts.scheme}://{parts.netloc}{path}', {'token': key}) as response:
+		if response.headers.get_content_type() == 'application/json' and not name.endswith('.json'):
+			raise ValueError(f'Moodle refused the file: {response.read(500).decode("utf-8", "replace")}')
+		size = 0
+		with open(partial, 'wb') as file:
+			while chunk := response.read(1 << 16):
+				size += len(chunk)
+				if size > MAX_DOWNLOAD:
+					partial.unlink()
+					raise ValueError('File is larger than 200 MB.')
+				file.write(chunk)
+	os.replace(partial, target)
+	return target
+
+
+def handle(method, params):
+	if method == 'initialize':
+		return {
+			'protocolVersion': params.get('protocolVersion', '2025-06-18'),
+			'capabilities': {'tools': {}},
+			'serverInfo': {'name': 'moodle', 'version': VERSION},
+		}
+	if method == 'ping':
+		return {}
+	if method == 'tools/list':
+		return {'tools': TOOLS}
+	if method != 'tools/call':
+		raise LookupError(method)
+	try:
+		name, args = params.get('name'), params.get('arguments') or {}
+		if name in ('moodle_read', 'moodle_write'):
+			result = tidy(call(args.get('function'), args.get('args') or {}, write=name == 'moodle_write'))
+			text = json.dumps(result, ensure_ascii=False)
+		elif name == 'moodle_upload':
+			text = json.dumps(upload(str(args.get('path')), args.get('itemid') or 0), ensure_ascii=False)
+		elif name == 'moodle_download':
+			text = str(download(str(args.get('url')), args.get('directory')))
+		else:
+			raise ValueError(f'Unknown tool {name}.')
+		return {'content': [{'type': 'text', 'text': text}]}
+	except Exception as error:
+		return {'content': [{'type': 'text', 'text': f'{type(error).__name__}: {error}'}], 'isError': True}
+
+
+def key_from_link(link, site, passport):
+	"""Reads the key out of the app sign-in link, which answers one passport only."""
+	try:
+		encoded = urllib.parse.unquote(link.strip().strip('"\'').partition('token=')[2])
+		site_id, key, *_ = base64.b64decode(encoded, validate=True).decode().split(':::')
+	except (binascii.Error, ValueError):
+		raise ValueError('That is not the sign-in link: it starts with moodlemobile://token=') from None
+	if site_id != hashlib.md5(f'{site}{passport}'.encode()).hexdigest():
+		raise ValueError('That link belongs to another sign-in. Start again.')
+	return key
+
+
+def receive_link():
+	"""Returns the app sign-in link, from the browser (which runs `moodle-mcp <link>`) or pasted here."""
+	path = CACHE / '.login'
+	CACHE.mkdir(parents=True, exist_ok=True)
+	path.unlink(missing_ok=True)
+	os.mkfifo(path, 0o600)
+	# Read-write, so the pipe never reads as closed while no browser has written yet.
+	pipe = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+	sources = [pipe, sys.stdin]
+	saved = termios.tcgetattr(sys.stdin) if sys.stdin.isatty() else None
+	try:
+		if saved:
+			hidden = termios.tcgetattr(sys.stdin)
+			hidden[3] &= ~termios.ECHO
+			termios.tcsetattr(sys.stdin, termios.TCSAFLUSH, hidden)
+		while True:
+			if pipe in select.select(sources, [], [])[0]:
+				return os.read(pipe, 4096).decode()
+			line = sys.stdin.readline()
+			if not line:
+				sources.remove(sys.stdin)  # no terminal, so only the browser can answer
+			elif line.strip():
+				return line
+	finally:
+		if saved:
+			termios.tcsetattr(sys.stdin, termios.TCSAFLUSH, saved)
+		os.close(pipe)
+		path.unlink(missing_ok=True)
+
+
+def hand_over(link):
+	try:
+		pipe = os.open(CACHE / '.login', os.O_WRONLY | os.O_NONBLOCK)
+	except OSError:
+		raise ValueError('No `moodle-mcp login` is waiting for this link.') from None
+	try:
+		os.write(pipe, link.encode())
+	finally:
+		os.close(pipe)
+
+
+def public_config(site):
+	query = json.dumps([{'index': 0, 'methodname': 'tool_mobile_get_public_config', 'args': {}}]).encode()
+	try:
+		with post(f'{site}/lib/ajax/service-nologin.php', None, query, 'application/json') as response:
+			reply = json.load(response)[0]
+	except (ValueError, LookupError, TypeError):
+		raise ValueError(f'{site} does not look like a Moodle site.') from None
+	if reply.get('error') or 'data' not in reply:
+		raise ValueError(f'{site} does not allow the Moodle app, which moodle-mcp signs in as.')
+	return reply['data']
+
+
+def browser_login(site, launch_url):
+	passport = secrets.token_hex(8)
+	fields = {'service': 'moodle_mobile_app', 'passport': passport, 'urlscheme': 'moodlemobile', 'confirmed': 1}
+	link = f'{launch_url}?{urllib.parse.urlencode(fields)}'
+	print(f'Sign in to Moodle in your browser:\n\n   {link}\n')
+	print('Then let the browser open the moodlemobile link with moodle-mcp. If nothing happens, click')
+	print('"Click here to launch the app". If the browser still cannot open it, copy that link and')
+	print('paste it here (hidden): ', end='', flush=True)
+	# Without a desktop, webbrowser would take over this terminal with a text browser.
+	if os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+		webbrowser.open(link)
+	return key_from_link(receive_link(), site, passport)
+
+
+def password_login(site):
+	fields = {'username': input('Username: '), 'password': getpass.getpass(), 'service': 'moodle_mobile_app'}
+	with post(f'{site}/login/token.php', fields) as response:
+		reply = json.load(response)
+	if 'token' not in reply:
+		raise ValueError(reply.get('error') or 'The site did not return a key.')
+	return reply['token']
+
+
+def login(address):
+	address = address.rstrip('/') if '://' in address else f'https://{address.rstrip("/")}'
+	config = public_config(address)
+	site = config.get('wwwroot') or address
+	# App-style sign-in without single sign-on: the site refuses the browser hand-off unless just signed in.
+	if config.get('typeoflogin') == 1 and not config.get('identityproviders'):
+		key = password_login(site)
+	else:
+		key = browser_login(site, config.get('launchurl') or f'{site}/admin/tool/mobile/launch.php')
+	fields = [('wstoken', key), ('wsfunction', 'core_webservice_get_site_info'), ('moodlewsrestformat', 'json')]
+	with post(f'{site}/webservice/rest/server.php', fields) as response:
+		info = json.load(response)
+	if 'userid' not in info:
+		raise ValueError('The site did not accept that key.')
+	save(site, key)
+	print(f'\nSigned in to {site} as {info.get("fullname")}. The key is in {CONFIG}.')
+
+
+def main():
+	args = sys.argv[1:]
+	if args[:1] == ['login'] or (len(args) == 1 and args[0].startswith('moodlemobile:')):
+		try:
+			if args[0] != 'login':
+				hand_over(args[0])
+			elif len(args) == 2:
+				login(args[1])
+			else:
+				raise ValueError('usage: moodle-mcp login <site address, e.g. moodle.example.edu>')
+		except (ValueError, OSError) as error:
+			sys.exit(f'moodle-mcp: {error}')
+		except KeyboardInterrupt:
+			sys.exit('\nmoodle-mcp: cancelled')
+		return
+	if args or sys.stdin.isatty():
+		sys.exit(__doc__.strip())
+	for line in sys.stdin:
+		try:
+			message = json.loads(line)
+			request_id = message['id']
+		except (ValueError, KeyError, TypeError):
+			continue  # blank line or notification: nothing to answer
+		try:
+			reply = {'result': handle(message.get('method'), message.get('params') or {})}
+		except LookupError:
+			reply = {'error': {'code': -32601, 'message': 'Method not found'}}
+		print(json.dumps({'jsonrpc': '2.0', 'id': request_id, **reply}), flush=True)
+
+
+if __name__ == '__main__':
+	main()
