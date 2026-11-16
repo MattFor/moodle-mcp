@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `moodle_read` and `moodle_write`: an `args` field named `wsfunction` can no longer swap the checked function for another one.
+- `moodle_download`: same-named files from different URLs no longer replace each other in the cache.
+
 ## [1.0.0] - 12:42 CEST 15-11-2026
 
 ### Added

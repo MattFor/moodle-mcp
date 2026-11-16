@@ -218,6 +218,11 @@ class Calls(Base):
 		self.assertIn(('assignmentid', '4'), fields)
 		self.assertIn(('acceptsubmissionstatement', '1'), fields)
 
+	def test_args_cannot_replace_the_function(self):
+		args = {'wsfunction': 'mod_assign_submit_for_grading', 'moodlewsrestformat': 'xml'}
+		self.assertEqual(moodle.call('core_webservice_get_site_info', args)['userid'], 3)
+		self.assertEqual(FakeMoodle.seen[0][1][-1], ('moodlewsrestformat', 'json'))
+
 	def test_errors(self):
 		with self.assertRaisesRegex(ValueError, 'accessexception: Access control exception'):
 			moodle.call('core_user_get_users', {})
@@ -247,7 +252,8 @@ class Calls(Base):
 	def test_download(self):
 		url = f'{self.site}/pluginfile.php/7/mod_resource/content/1/wyk%C5%82ad.pdf?forcedownload=1'
 		target = moodle.download(url)
-		self.assertEqual((target, target.read_bytes()), (moodle.CACHE / 'wykład.pdf', b'%PDF-1.7 lecture'))
+		self.assertEqual((target.parent.parent, target.name), (moodle.CACHE, 'wykład.pdf'))
+		self.assertEqual(target.read_bytes(), b'%PDF-1.7 lecture')
 		self.assertEqual(FakeMoodle.seen[0][1], [('token', TOKEN)])
 		self.assertEqual(moodle.download(url), target)
 		mine = Path(self.dir.name) / 'mine'
@@ -256,7 +262,7 @@ class Calls(Base):
 			moodle.download(url, str(mine))
 		with self.assertRaisesRegex(ValueError, 'refused the file'):
 			moodle.download(f'{self.site}/pluginfile.php/9/gone.pdf')
-		self.assertEqual(sorted(p.name for p in moodle.CACHE.iterdir()), ['wykład.pdf'])
+		self.assertEqual([p.name for p in moodle.CACHE.glob('*/*')], ['wykład.pdf'])
 
 	def test_token_never_leaves_the_site(self):
 		before = len(FakeMoodle.seen)

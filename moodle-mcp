@@ -184,7 +184,8 @@ def post(url, fields, data=None, content_type=None, timeout=60):
 def call(function, args, write=False):
 	check(function, write)
 	site, key = signed_in()
-	fields = [('wstoken', key), ('wsfunction', function), ('moodlewsrestformat', 'json'), *flatten(args)]
+	# PHP keeps the last of repeated fields, so ours go after args or args could swap in an unchecked function
+	fields = [*flatten(args), ('wstoken', key), ('wsfunction', function), ('moodlewsrestformat', 'json')]
 	with post(f'{site}/webservice/rest/server.php', fields) as response:
 		result = json.load(response)
 	if isinstance(result, dict) and 'exception' in result:
@@ -225,7 +226,8 @@ def download(url, directory=None):
 	name = os.path.basename(urllib.parse.unquote(path))
 	if name in ('', '.', '..'):
 		name = 'file'
-	folder = Path(directory).expanduser() if directory else CACHE
+	# One cache folder per file URL, so same-named files from different courses do not replace each other.
+	folder = Path(directory).expanduser() if directory else CACHE / hashlib.sha256(path.encode()).hexdigest()[:12]
 	target = folder / name
 	if directory and target.exists():
 		raise ValueError(f'{target} already exists; pick another directory.')
