@@ -234,8 +234,7 @@ def download(url, directory=None):
 	folder.mkdir(parents=True, exist_ok=True)
 	partial = target.with_name(f'{name}.part')
 	with post(f'{parts.scheme}://{parts.netloc}{path}', {'token': key}) as response:
-		if response.headers.get_content_type() == 'application/json' and not name.endswith('.json'):
-			raise ValueError(f'Moodle refused the file: {response.read(500).decode("utf-8", "replace")}')
+		is_json = response.headers.get_content_type() == 'application/json'
 		size = 0
 		with open(partial, 'wb') as file:
 			while chunk := response.read(1 << 16):
@@ -244,6 +243,17 @@ def download(url, directory=None):
 					partial.unlink()
 					raise ValueError('File is larger than 200 MB.')
 				file.write(chunk)
+	# Notebooks also come as JSON; only Moodle's error object is a refusal.
+	if is_json and size < 1 << 16:
+		body = partial.read_bytes()
+		try:
+			reply = json.loads(body)
+		except ValueError:
+			reply = None
+		refused = isinstance(reply, dict) and 'errorcode' in reply
+		if refused:
+			partial.unlink()
+			raise ValueError(f'Moodle refused the file: {body[:500].decode("utf-8", "replace")}')
 	os.replace(partial, target)
 	return target
 

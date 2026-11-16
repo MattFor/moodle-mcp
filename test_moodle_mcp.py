@@ -86,6 +86,8 @@ class FakeMoodle(BaseHTTPRequestHandler):
 			return self.reply(body)
 		if self.path == '/webservice/pluginfile.php/7/mod_resource/content/1/wyk%C5%82ad.pdf':
 			return self.reply(b'%PDF-1.7 lecture', 'application/pdf')
+		if self.path == '/webservice/pluginfile.php/8/mod_assign/introattachment/0/lab.ipynb':
+			return self.reply({'cells': [], 'nbformat': 4})
 		return self.reply({'error': 'File not found', 'errorcode': 'filenotfound'})
 
 	def reply(self, body, content_type='application/json'):
@@ -263,6 +265,8 @@ class Calls(Base):
 		with self.assertRaisesRegex(ValueError, 'refused the file'):
 			moodle.download(f'{self.site}/pluginfile.php/9/gone.pdf')
 		self.assertEqual([p.name for p in moodle.CACHE.glob('*/*')], ['wykład.pdf'])
+		notebook = moodle.download(f'{self.site}/pluginfile.php/8/mod_assign/introattachment/0/lab.ipynb', str(mine))
+		self.assertEqual(json.loads(notebook.read_text()), {'cells': [], 'nbformat': 4})
 
 	def test_token_never_leaves_the_site(self):
 		before = len(FakeMoodle.seen)
