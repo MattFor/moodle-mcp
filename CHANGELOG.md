@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.0.3] - 12:43 CET 17-11-2026
 
 ### Added
 
@@ -30,6 +30,7 @@
 - `moodle-mcp login <site>`: signs in through the browser, which hands the key back to the terminal, or with a password on sites without single sign-on.
 - `install`: registers the `moodlemobile://` link handler and, with `--mcp`, the server with Claude Code, Codex, Copilot CLI and Cursor.
 
+[1.0.3]: https://github.com/MattFor/moodle-mcp/releases/tag/v1.0.3
 [1.0.2]: https://github.com/MattFor/moodle-mcp/releases/tag/v1.0.2
 [1.0.1]: https://github.com/MattFor/moodle-mcp/releases/tag/v1.0.1
 [1.0.0]: https://github.com/MattFor/moodle-mcp/releases/tag/v1.0.0
