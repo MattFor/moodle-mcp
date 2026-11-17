@@ -65,3 +65,32 @@ jobs:
 
       - name: Unit tests
         run: python -m unittest -v
+
+  package:
+    name: Build and smoke-test the package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Build
+        run: uv build
+
+      - name: Check metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Run both commands from the built wheel on the oldest and newest Python
+        run: |
+          for python in 3.10 3.14; do
+            for command in moodle-mcp moodle-mcp-server; do
+              echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+                | uv run --isolated --no-project --python "$python" --with dist/*.whl "$command" \
+                | grep -q '"serverInfo"'
+            done
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*

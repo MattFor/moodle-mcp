@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Published on PyPI as `moodle-mcp-server`: `uv tool install moodle-mcp-server` (or `pipx`) installs the `moodle-mcp` command, and `uvx moodle-mcp-server` runs the server without installing.
+
 ## [1.0.2] - 12:19 CET 16-11-2026
 
 ### Fixed

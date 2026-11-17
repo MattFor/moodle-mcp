@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moodle-mcp-server"
+# From VERSION in the script, which .github/bump-version sets
+dynamic = ["version"]
+description = "MCP server that lets AI agents use a Moodle account: courses, deadlines, grades, files and homework submissions."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "MattFor", email = "mattfor@relaxy.xyz" }]
+keywords = ["mcp", "mcp-server", "moodle", "ai-agents"]
+classifiers = [
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Education",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/MattFor/moodle-mcp"
+Issues = "https://github.com/MattFor/moodle-mcp/issues"
+Changelog = "https://github.com/MattFor/moodle-mcp/blob/master/CHANGELOG.md"
+
+[project.scripts]
+moodle-mcp = "moodle_mcp:main"
+# What `uvx moodle-mcp-server` and the MCP registry run
+moodle-mcp-server = "moodle_mcp:main"
+
+[tool.hatch.version]
+path = "moodle-mcp"
+
+[tool.hatch.build.targets.sdist]
+include = ["moodle-mcp", "CHANGELOG.md"]
+
+# The script stays extensionless for ./install; the wheel ships it as an importable module
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.wheel.force-include]
+"moodle-mcp" = "moodle_mcp.py"
