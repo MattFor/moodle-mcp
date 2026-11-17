@@ -1,7 +1,7 @@
 # Moodle MCP
 
 [![CI](https://github.com/MattFor/moodle-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/MattFor/moodle-mcp/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/MattFor/moodle-mcp)](https://github.com/MattFor/moodle-mcp/releases)
+[![PyPI](https://img.shields.io/pypi/v/moodle-mcp-server)](https://pypi.org/project/moodle-mcp-server/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 MCP server that lets AI agents use a Moodle account: courses, deadlines, grades, files and homework submissions.
